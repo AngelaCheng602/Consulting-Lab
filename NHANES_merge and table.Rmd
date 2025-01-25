@@ -1,0 +1,1300 @@
+---
+title: "NHANES_merge"
+author: "Yiyuan Kang"
+date: "2024-11-25"
+output:
+  pdf_document:
+    latex_engine: xelatex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(foreign)
+library(survey)
+```
+
+## NHANES 2009-2010 Data
+```{r data import 2009_10, warning = FALSE}
+setwd("/Users/kangyiyuan/Desktop/Consulting Lab/NHANES Data/NHANES 2009_2010")
+library(foreign)
+diet_0910 <- read.xport("DBQ_F.XPT")
+dep_0910 <- read.xport("DPQ_F.XPT")
+fsq_0910 <- read.xport("FSQ_F.XPT")
+sleep_0910 <- read.xport("SLQ_F.XPT")
+demo_0910 <- read.xport("DEMO_F.XPT")
+bmx_0910 <- read.xport("BMX_F.xpt")
+paq_0910 <- read.xport("PAQ_F.xpt")
+alc_0910 <- read.xport("ALQ_F.xpt")
+smo_0910 <- read.xport("SMQ_F.xpt")
+```
+
+```{r variable selection 2009_10}
+library(dplyr)
+diet_0910 <- diet_0910 %>% dplyr::select(SEQN, DBQ700)
+dep_0910 <- dep_0910 %>% dplyr::select(SEQN, DPQ010,  DPQ020,  DPQ030,  DPQ040,  DPQ050,  DPQ060,  DPQ070,  DPQ080,  DPQ090,  DPQ100)
+fsq_0910 <- fsq_0910 %>% dplyr::select(SEQN, FSDHH)
+sleep_0910 <- sleep_0910 %>% dplyr::select(SEQN, SLD010H)
+demo_0910 <- demo_0910 %>% dplyr::select(SEQN,
+                                         RIAGENDR, # gender
+                                         RIDAGEYR, # age
+                                         RIDRETH1, # race/ethnicity
+                                         DMDBORN2, # country of birth
+                                         DMDMARTL, # marital status
+                                         DMDEDUC2, # education level
+                                         INDFMIN2, # annual family income
+                                         INDFMPIR, # ratio of family income to poverty 
+                                         WTINT2YR, # full sample 2 year interview weight
+                                         WTMEC2YR, # full sample 2 year MEC exam weight
+                                         SDMVPSU, # Primary sampling units (PSU)
+                                         SDMVSTRA # strata
+                                         )
+bmx_0910 <- bmx_0910 %>% dplyr::select(SEQN, BMXBMI)
+paq_0910 <- paq_0910 %>% dplyr::select(SEQN, PAD660, PAD675, PAQ655, PAQ670)
+alc_0910 <- alc_0910 %>% dplyr::select(SEQN, ALQ101, ALQ120Q, ALQ120U, ALQ130)
+smo_0910 <- smo_0910 %>% dplyr::select(SEQN, SMQ040, SMQ020)   
+```
+
+```{r merge 2009_10}
+library(dplyr)
+merged_0910 <- diet_0910 %>%
+  full_join(alc_0910, by = "SEQN") %>%
+  full_join(dep_0910, by = "SEQN") %>%
+  full_join(fsq_0910, by = "SEQN") %>%
+  full_join(sleep_0910, by = "SEQN")  %>%
+  full_join(demo_0910, by = "SEQN") %>%
+  full_join(bmx_0910, by = "SEQN") %>%
+  full_join(paq_0910, by = "SEQN") %>%
+  full_join(smo_0910, by = "SEQN") %>%
+  mutate(Year = "2009-2010")  # Add column for year of cycle
+# Recoding missing or unknown entires to NA
+merged_0910[merged_0910 == 7 | merged_0910 == 9 | merged_0910 == 77 | merged_0910 == 99 | merged_0910 == 7777 | merged_0910 == 9999] <- NA
+```
+
+```{r variables recategorize}
+## SMOKING STATUS
+# Function to categorize smoking status
+categorize_smoking <- function(SMQ020, SMQ040) {
+  if (is.na(SMQ020)) {
+    return("Missing")
+  }
+  if (SMQ020 == 2) {
+    return("Never Smoker")
+  }
+  if (SMQ020 == 1) {
+    if (is.na(SMQ040)) {
+      return("Missing") 
+    }
+    if (SMQ040 == 3) {
+      return("Former Smoker") 
+    }
+    if (SMQ040 == 1 | SMQ040 == 2) {
+      return("Current Smoker") 
+    }
+  }
+  return("Missing") # Catch unhandled cases
+}
+
+# Apply the function to each row
+merged_0910$Smoking_Status <- mapply(categorize_smoking, merged_0910$SMQ020, merged_0910$SMQ040)
+
+## DEPRESSION
+# Calculate the PHQ-9 total score
+merged_0910$PHQ9_Total <- rowSums(merged_0910[, paste0("DPQ", sprintf("%03d", seq(10, 90, 10)))], na.rm = TRUE)
+
+# Create a binary depression status variable
+merged_0910$Depression_Status <- ifelse(merged_0910$PHQ9_Total >= 10, "Depressed", "Not Depressed")
+
+## ALCOHOL USE
+# Step 1: Separate non-drinkers and drinkers
+merged_0910$Alcohol_Status <- ifelse(merged_0910$ALQ101 == 2, "Non-Drinker", "Drinker")
+
+# Step 2: Calculate weekly frequency based on ALQ120U
+merged_0910$Weekly_Frequency <- with(merged_0910, 
+  ifelse(ALQ120U == 1, ALQ120Q,                     # Time unit: Week
+  ifelse(ALQ120U == 2, ALQ120Q / 4.33,             # Time unit: Month -> Approx. weeks per month
+  ifelse(ALQ120U == 3, ALQ120Q / 52, NA))))        # Time unit: Year -> Weeks per year
+
+# Step 3: Calculate total drinks per week
+merged_0910$Drinks_Per_Week <- with(merged_0910, Weekly_Frequency * ALQ130)
+
+# Step 4: Categorize drinkers based on sex and weekly consumption
+merged_0910$Drinking_Category <- with(merged_0910, ifelse(
+  Alcohol_Status == "Non-Drinker", "Non-Drinker",
+  ifelse(RIAGENDR == 1 & Drinks_Per_Week <= 14, "Low-Moderate Drinker",  # Men: ≤14
+  ifelse(RIAGENDR == 1 & Drinks_Per_Week > 14, "Heavy Drinker",          # Men: >14
+  ifelse(RIAGENDR == 2 & Drinks_Per_Week <= 7, "Low-Moderate Drinker",   # Women: ≤7
+  ifelse(RIAGENDR == 2 & Drinks_Per_Week > 7, "Heavy Drinker", NA)))))) # Women: >7
+
+## PHYSICAL ACTIVITY 
+# Calculate Vigorous Minutes/Week and Moderate Minutes/Week
+merged_0910$Vigorous_Minutes_Week <- with(merged_0910, PAQ655 * PAD660)
+
+merged_0910$Moderate_Minutes_Week <- with(merged_0910, PAQ670 * PAD675)
+
+# Calculate Moderate-Equivalent Minutes/Week
+merged_0910$Moderate_Equivalent_Minutes_Week <- merged_0910$Moderate_Minutes_Week + (2 * merged_0910$Vigorous_Minutes_Week)
+
+# Determine if the participant meets the guidelines (≥150 minutes/week)
+merged_0910$Meets_Guidelines <- ifelse(merged_0910$Moderate_Equivalent_Minutes_Week >= 150, "Yes", "No")
+```
+
+## NHANES 2011- 2012 Data
+```{r data import 2011_12, warning  = FALSE}
+setwd("/Users/kangyiyuan/Desktop/Consulting Lab/NHANES Data/NHANES 2011_2012")
+library(foreign)
+diet_1112 <- read.xport("DBQ_G.XPT")
+dep_1112 <- read.xport("DPQ_G.XPT")
+fsq_1112 <- read.xport("FSQ_G.XPT")
+sleep_1112 <- read.xport("SLQ_G.XPT")
+demo_1112 <- read.xport("DEMO_G.XPT") 
+bmx_1112 <- read.xport("BMX_G.xpt") 
+paq_1112 <- read.xport("PAQ_G.xpt")
+alc_1112 <- read.xport("ALQ_G.xpt")
+smo_1112 <- read.xport("SMQ_G.xpt")
+```
+
+```{r variable selection 2011_12}
+diet_1112 <- diet_1112 %>% dplyr::select(SEQN, DBQ700)
+dep_1112 <- dep_1112 %>% dplyr::select(SEQN, DPQ010,  DPQ020,  DPQ030,  DPQ040,  DPQ050,  DPQ060,  DPQ070,  DPQ080,  DPQ090,  DPQ100)
+fsq_1112 <- fsq_1112 %>% dplyr::select(SEQN, FSDHH)
+sleep_1112 <- sleep_0910 %>% dplyr::select(SEQN, SLD010H)
+demo_1112 <- demo_1112 %>% dplyr::select(SEQN,
+                                         RIAGENDR, # gender
+                                         RIDAGEYR, # age
+                                         RIDRETH1, # race/ethnicity
+                                         DMDBORN4, # country of birth
+                                         DMDMARTL, # marital status
+                                         DMDEDUC2, # education level
+                                         INDFMIN2, # annual family income
+                                         INDFMPIR, # ratio of family income to poverty 
+                                         WTINT2YR, # full sample 2 year interview weight
+                                         WTMEC2YR, # full sample 2 year MEC exam weight
+                                         SDMVPSU, # Primary sampling units (PSU)
+                                         SDMVSTRA # strata
+                                         )
+bmx_1112 <- bmx_1112 %>% dplyr::select(SEQN, BMXBMI)
+paq_1112 <- paq_1112 %>% dplyr::select(SEQN, PAD660, PAD675, PAQ655, PAQ670)
+alc_1112 <- alc_1112 %>% dplyr::select(SEQN, ALQ101, ALQ120Q, ALQ120U, ALQ130)
+smo_1112 <- smo_1112 %>% dplyr::select(SEQN, SMQ040, SMQ020) 
+```
+
+```{r merge 2011_12}
+library(dplyr)
+merged_1112 <- diet_1112 %>%
+  full_join(dep_1112, by = "SEQN") %>%
+  full_join(fsq_1112, by = "SEQN") %>%
+  full_join(sleep_1112, by = "SEQN") %>%
+  full_join(demo_1112, by = "SEQN") %>%
+  full_join(bmx_1112, by = "SEQN") %>%
+  full_join(alc_1112, by = "SEQN") %>%
+  full_join(paq_1112, by = "SEQN") %>%
+  full_join(smo_1112, by = "SEQN") %>%
+  mutate(Year = "2011-2012")  # Add column for year of cycle
+
+# Recoding missing or unknown entires to NA
+merged_1112[merged_1112 == 7 | merged_1112 == 9 | merged_1112 == 77 | merged_1112 == 99 | merged_1112 == 7777 | merged_1112 == 9999] <- NA
+```
+
+```{r variables recategorize 2011_12}
+## SMOKING STATUS
+# Function to categorize smoking status
+categorize_smoking <- function(SMQ020, SMQ040) {
+  if (is.na(SMQ020)) {
+    return("Missing")
+  }
+  if (SMQ020 == 2) {
+    return("Never Smoker")
+  }
+  if (SMQ020 == 1) {
+    if (is.na(SMQ040)) {
+      return("Missing") 
+    }
+    if (SMQ040 == 3) {
+      return("Former Smoker") 
+    }
+    if (SMQ040 == 1 | SMQ040 == 2) {
+      return("Current Smoker") 
+    }
+  }
+  return("Missing") # Catch unhandled cases
+}
+
+
+# Apply the function to each row
+merged_1112$Smoking_Status <- mapply(categorize_smoking, merged_1112$SMQ020, merged_1112$SMQ040)
+
+## DEPRESSION
+# Calculate the PHQ-9 total score
+merged_1112$PHQ9_Total <- rowSums(merged_1112[, paste0("DPQ", sprintf("%03d", seq(10, 90, 10)))], na.rm = TRUE)
+
+# Create a binary depression status variable
+merged_1112$Depression_Status <- ifelse(merged_1112$PHQ9_Total >= 10, "Depressed", "Not Depressed")
+
+## ALCOHOL USE
+# Step 1: Separate non-drinkers and drinkers
+merged_1112$Alcohol_Status <- ifelse(merged_1112$ALQ101 == 2, "Non-Drinker", "Drinker")
+
+# Step 2: Calculate weekly frequency based on ALQ120U
+merged_1112$Weekly_Frequency <- with(merged_1112, 
+  ifelse(ALQ120U == 1, ALQ120Q,                     # Time unit: Week
+  ifelse(ALQ120U == 2, ALQ120Q / 4.33,             # Time unit: Month -> Approx. weeks per month
+  ifelse(ALQ120U == 3, ALQ120Q / 52, NA))))        # Time unit: Year -> Weeks per year
+
+# Step 3: Calculate total drinks per week
+merged_1112$Drinks_Per_Week <- with(merged_1112, Weekly_Frequency * ALQ130)
+
+# Step 4: Categorize drinkers based on sex and weekly consumption
+merged_1112$Drinking_Category <- with(merged_1112, ifelse(
+  Alcohol_Status == "Non-Drinker", "Non-Drinker",
+  ifelse(RIAGENDR == 1 & Drinks_Per_Week <= 14, "Low-Moderate Drinker",  # Men: ≤14
+  ifelse(RIAGENDR == 1 & Drinks_Per_Week > 14, "Heavy Drinker",          # Men: >14
+  ifelse(RIAGENDR == 2 & Drinks_Per_Week <= 7, "Low-Moderate Drinker",   # Women: ≤7
+  ifelse(RIAGENDR == 2 & Drinks_Per_Week > 7, "Heavy Drinker", NA)))))) # Women: >7
+
+## PHYSICAL ACTIVITY 
+# Calculate Vigorous Minutes/Week and Moderate Minutes/Week
+merged_1112$Vigorous_Minutes_Week <- with(merged_1112, PAQ655 * PAD660)
+
+merged_1112$Moderate_Minutes_Week <- with(merged_1112, PAQ670 * PAD675)
+
+# Calculate Moderate-Equivalent Minutes/Week
+merged_1112$Moderate_Equivalent_Minutes_Week <- merged_1112$Moderate_Minutes_Week + (2 * merged_1112$Vigorous_Minutes_Week)
+
+# Determine if the participant meets the guidelines (≥150 minutes/week)
+merged_1112$Meets_Guidelines <- ifelse(merged_1112$Moderate_Equivalent_Minutes_Week >= 150, "Yes", "No")
+```
+
+## NHANES 2013 - 2014 Data
+```{r data import 2013_14, warning  = FALSE}
+setwd("/Users/kangyiyuan/Desktop/Consulting Lab/NHANES Data/NHANES 2013_2014")
+library(foreign)
+diet_1314 <- read.xport("DBQ_H.XPT")
+dep_1314  <- read.xport("DPQ_H.XPT")
+fsq_1314 <- read.xport("FSQ_H.XPT")
+sleep_1314  <- read.xport("SLQ_H.XPT")
+demo_1314 <- read.xport("DEMO_H.XPT")
+bmx_1314 <- read.xport("BMX_H.xpt") 
+alc_1314 <- read.xport("ALQ_H.xpt")
+paq_1314 <- read.xport("PAQ_H.xpt")
+smo_1314 <- read.xport("SMQ_H.xpt")
+```
+
+```{r variable selection 2013_14}
+diet_1314 <- diet_1314 %>% dplyr::select(SEQN, DBQ700)
+dep_1314 <- dep_1314 %>% dplyr::select(SEQN, DPQ010,  DPQ020,  DPQ030,  DPQ040,  DPQ050,  DPQ060,  DPQ070,  DPQ080,  DPQ090,  DPQ100)
+fsq_1314 <- fsq_1314 %>% dplyr::select(SEQN, FSDHH)
+sleep_1314 <- sleep_0910 %>% dplyr::select(SEQN, SLD010H)
+demo_1314 <- demo_1314 %>% dplyr::select(SEQN,
+                                         RIAGENDR, # gender
+                                         RIDAGEYR, # age
+                                         RIDRETH1, # race/ethnicity
+                                         DMDBORN4, # country of birth
+                                         DMDMARTL, # marital status
+                                         DMDEDUC2, # education level
+                                         INDFMIN2, # annual family income
+                                         INDFMPIR, # ratio of family income to poverty 
+                                         WTINT2YR, # full sample 2 year interview weight
+                                         WTMEC2YR, # full sample 2 year MEC exam weight
+                                         SDMVPSU, # Primary sampling units (PSU)
+                                         SDMVSTRA # strata
+                                         )
+bmx_1314 <- bmx_1314 %>% dplyr::select(SEQN, BMXBMI)
+alc_1314 <- alc_1314 %>% dplyr::select(SEQN, ALQ101, ALQ120Q, ALQ120U, ALQ130)
+paq_1314 <- paq_1314 %>% dplyr::select(SEQN, PAQ655, PAD660, PAQ670,PAD675)
+smo_1314 <- smo_1314 %>% dplyr::select(SEQN, SMQ040, SMQ020)
+```
+
+```{r merge 2013_14}
+library(dplyr)
+merged_1314 <- diet_1314 %>%
+  full_join(dep_1314, by = "SEQN") %>%
+  full_join(fsq_1314, by = "SEQN") %>%
+  full_join(sleep_1314, by = "SEQN")%>%
+  full_join(demo_1314, by = "SEQN") %>%
+  full_join(bmx_1314, by = "SEQN") %>%
+  full_join(alc_1314, by = "SEQN") %>%
+  full_join(paq_1314, by = "SEQN") %>%
+  full_join(smo_1314, by = "SEQN") %>%
+  mutate(Year = "2013-2014")  # Add column for year of cycle
+
+# Recoding missing or unknown entires to NA
+merged_1314[merged_1314 == 7 | merged_1314 == 9 | merged_1314 == 77 | merged_1314 == 99 | merged_1314 == 7777 | merged_1314 == 9999] <- NA
+```
+
+```{r variables recategorize 2013_14}
+## SMOKING STATUS
+# Function to categorize smoking status
+categorize_smoking <- function(SMQ020, SMQ040) {
+  if (is.na(SMQ020)) {
+    return("Missing")
+  }
+  if (SMQ020 == 2) {
+    return("Never Smoker")
+  }
+  if (SMQ020 == 1) {
+    if (is.na(SMQ040)) {
+      return("Missing") 
+    }
+    if (SMQ040 == 3) {
+      return("Former Smoker") 
+    }
+    if (SMQ040 == 1 | SMQ040 == 2) {
+      return("Current Smoker") 
+    }
+  }
+  return("Missing") # Catch unhandled cases
+}
+
+
+# Apply the function to each row
+merged_1314$Smoking_Status <- mapply(categorize_smoking, merged_1314$SMQ020, merged_1314$SMQ040)
+
+## DEPRESSION
+# Calculate the PHQ-9 total score
+merged_1314$PHQ9_Total <- rowSums(merged_1314[, paste0("DPQ", sprintf("%03d", seq(10, 90, 10)))], na.rm = TRUE)
+
+# Create a binary depression status variable
+merged_1314$Depression_Status <- ifelse(merged_1314$PHQ9_Total >= 10, "Depressed", "Not Depressed")
+
+## ALCOHOL USE
+# Step 1: Separate non-drinkers and drinkers
+merged_1314$Alcohol_Status <- ifelse(merged_1314$ALQ101 == 2, "Non-Drinker", "Drinker")
+
+# Step 2: Calculate weekly frequency based on ALQ120U
+merged_1314$Weekly_Frequency <- with(merged_1314, 
+  ifelse(ALQ120U == 1, ALQ120Q,                     # Time unit: Week
+  ifelse(ALQ120U == 2, ALQ120Q / 4.33,             # Time unit: Month -> Approx. weeks per month
+  ifelse(ALQ120U == 3, ALQ120Q / 52, NA))))        # Time unit: Year -> Weeks per year
+
+# Step 3: Calculate total drinks per week
+merged_1314$Drinks_Per_Week <- with(merged_1314, Weekly_Frequency * ALQ130)
+
+# Step 4: Categorize drinkers based on sex and weekly consumption
+merged_1314$Drinking_Category <- with(merged_1314, ifelse(
+  Alcohol_Status == "Non-Drinker", "Non-Drinker",
+  ifelse(RIAGENDR == 1 & Drinks_Per_Week <= 14, "Low-Moderate Drinker",  # Men: ≤14
+  ifelse(RIAGENDR == 1 & Drinks_Per_Week > 14, "Heavy Drinker",          # Men: >14
+  ifelse(RIAGENDR == 2 & Drinks_Per_Week <= 7, "Low-Moderate Drinker",   # Women: ≤7
+  ifelse(RIAGENDR == 2 & Drinks_Per_Week > 7, "Heavy Drinker", NA)))))) # Women: >7
+
+## PHYSICAL ACTIVITY 
+# Calculate Vigorous Minutes/Week and Moderate Minutes/Week
+merged_1314$Vigorous_Minutes_Week <- with(merged_1314, PAQ655 * PAD660)
+
+merged_1314$Moderate_Minutes_Week <- with(merged_1314, PAQ670 * PAD675)
+
+# Calculate Moderate-Equivalent Minutes/Week
+merged_1314$Moderate_Equivalent_Minutes_Week <- merged_1314$Moderate_Minutes_Week + (2 * merged_1314$Vigorous_Minutes_Week)
+
+# Determine if the participant meets the guidelines (≥150 minutes/week)
+merged_1314$Meets_Guidelines <- ifelse(merged_1314$Moderate_Equivalent_Minutes_Week >= 150, "Yes", "No")
+```
+
+## NHANES 2015 - 2016 Data
+```{r data import 2015_16, warning  = FALSE}
+setwd("/Users/kangyiyuan/Desktop/Consulting Lab/NHANES Data/NHANES 2015_2016")
+library(foreign)
+diet_1516 <- read.xport("DBQ_I.XPT")
+dep_1516 <- read.xport("DPQ_I.XPT")
+fsq_1516 <- read.xport("FSQ_I.XPT")
+sleep_1516 <- read.xport("SLQ_I.XPT")
+demo_1516 <- read.xport("DEMO_I.XPT")
+bmx_1516 <- read.xport("BMX_I.xpt") 
+alc_1516 <- read.xport("ALQ_I.xpt")
+paq_1516 <- read.xport("PAQ_I.xpt")
+smo_1516 <- read.xport("SMQ_I.xpt")
+```
+
+```{r variable selection 2015_16}
+diet_1516 <- diet_1516 %>% dplyr::select(SEQN, DBQ700)
+dep_1516 <- dep_1516 %>% dplyr::select(SEQN, DPQ010,  DPQ020,  DPQ030,  DPQ040,  DPQ050,  DPQ060,  DPQ070,  DPQ080,  DPQ090,  DPQ100)
+fsq_1516 <- fsq_1516 %>% dplyr::select(SEQN, FSDHH)
+sleep_1516 <- sleep_1516 %>% dplyr::select(SEQN, SLD012)
+demo_1516 <- demo_1516 %>% dplyr::select(SEQN,
+                                         RIAGENDR, # gender
+                                         RIDAGEYR, # age
+                                         RIDRETH1, # race/ethnicity
+                                         DMDBORN4, # country of birth
+                                         DMDMARTL, # marital status
+                                         DMDEDUC2, # education level
+                                         INDFMIN2, # annual family income
+                                         INDFMPIR, # ratio of family income to poverty 
+                                         WTINT2YR, # full sample 2 year interview weight
+                                         WTMEC2YR, # full sample 2 year MEC exam weight
+                                         SDMVPSU, # Primary sampling units (PSU)
+                                         SDMVSTRA # strata
+                                         )
+bmx_1516 <- bmx_1516 %>% dplyr::select(SEQN, BMXBMI)
+alc_1516 <- alc_1516 %>% dplyr::select(SEQN, ALQ101, ALQ120Q, ALQ120U, ALQ130)
+paq_1516 <- paq_1516 %>% dplyr::select(SEQN, PAQ655, PAD660, PAQ670,PAD675)
+smo_1516 <- smo_1516 %>% dplyr::select(SEQN, SMQ040, SMQ020)
+```
+
+```{r merge 2015_16}
+library(dplyr)
+merged_1516 <- diet_1516 %>%
+  full_join(dep_1516, by = "SEQN") %>%
+  full_join(fsq_1516, by = "SEQN") %>%
+  full_join(sleep_1516, by = "SEQN") %>%
+  full_join(demo_1516, by = "SEQN") %>%
+  full_join(bmx_1516, by = "SEQN") %>%
+  full_join(alc_1516, by = "SEQN") %>%
+  full_join(paq_1516, by = "SEQN") %>%
+  full_join(smo_1516, by = "SEQN") %>%
+  mutate(Year = "2015-2016")  # Add column for year of cycle
+
+# Recoding missing or unknown entires to NA
+merged_1516[merged_1516 == 7 | merged_1516 == 9 | merged_1516 == 77 | merged_1516 == 99 | merged_1516 == 7777 | merged_1516 == 9999] <- NA
+```
+
+```{r variables recategorize 2013_14 2015_16}
+## SMOKING STATUS
+# Function to categorize smoking status
+categorize_smoking <- function(SMQ020, SMQ040) {
+  if (is.na(SMQ020)) {
+    return("Missing")
+  }
+  if (SMQ020 == 2) {
+    return("Never Smoker")
+  }
+  if (SMQ020 == 1) {
+    if (is.na(SMQ040)) {
+      return("Missing") 
+    }
+    if (SMQ040 == 3) {
+      return("Former Smoker") 
+    }
+    if (SMQ040 == 1 | SMQ040 == 2) {
+      return("Current Smoker") 
+    }
+  }
+  return("Missing") # Catch unhandled cases
+}
+
+
+# Apply the function to each row
+merged_1516$Smoking_Status <- mapply(categorize_smoking, merged_1516$SMQ020, merged_1516$SMQ040)
+
+## DEPRESSION
+# Calculate the PHQ-9 total score
+merged_1516$PHQ9_Total <- rowSums(merged_1516[, paste0("DPQ", sprintf("%03d", seq(10, 90, 10)))], na.rm = TRUE)
+
+# Create a binary depression status variable
+merged_1516$Depression_Status <- ifelse(merged_1516$PHQ9_Total >= 10, "Depressed", "Not Depressed")
+
+## ALCOHOL USE
+# Step 1: Separate non-drinkers and drinkers
+merged_1516$Alcohol_Status <- ifelse(merged_1516$ALQ101 == 2, "Non-Drinker", "Drinker")
+
+# Step 2: Calculate weekly frequency based on ALQ120U
+merged_1516$Weekly_Frequency <- with(merged_1516, 
+  ifelse(ALQ120U == 1, ALQ120Q,                     # Time unit: Week
+  ifelse(ALQ120U == 2, ALQ120Q / 4.33,             # Time unit: Month -> Approx. weeks per month
+  ifelse(ALQ120U == 3, ALQ120Q / 52, NA))))        # Time unit: Year -> Weeks per year
+
+# Step 3: Calculate total drinks per week
+merged_1516$Drinks_Per_Week <- with(merged_1516, Weekly_Frequency * ALQ130)
+
+# Step 4: Categorize drinkers based on sex and weekly consumption
+merged_1516$Drinking_Category <- with(merged_1516, ifelse(
+  Alcohol_Status == "Non-Drinker", "Non-Drinker",
+  ifelse(RIAGENDR == 1 & Drinks_Per_Week <= 14, "Low-Moderate Drinker",  # Men: ≤14
+  ifelse(RIAGENDR == 1 & Drinks_Per_Week > 14, "Heavy Drinker",          # Men: >14
+  ifelse(RIAGENDR == 2 & Drinks_Per_Week <= 7, "Low-Moderate Drinker",   # Women: ≤7
+  ifelse(RIAGENDR == 2 & Drinks_Per_Week > 7, "Heavy Drinker", NA)))))) # Women: >7
+
+## PHYSICAL ACTIVITY 
+# Calculate Vigorous Minutes/Week and Moderate Minutes/Week
+merged_1516$Vigorous_Minutes_Week <- with(merged_1516, PAQ655 * PAD660)
+
+merged_1516$Moderate_Minutes_Week <- with(merged_1516, PAQ670 * PAD675)
+
+# Calculate Moderate-Equivalent Minutes/Week
+merged_1516$Moderate_Equivalent_Minutes_Week <- merged_1516$Moderate_Minutes_Week + (2 * merged_1516$Vigorous_Minutes_Week)
+
+# Determine if the participant meets the guidelines (≥150 minutes/week)
+merged_1516$Meets_Guidelines <- ifelse(merged_1516$Moderate_Equivalent_Minutes_Week >= 150, "Yes", "No")
+```
+
+
+## NHANES 2017 - 2020 Data
+```{r data import 2017_20, warning  = FALSE}
+setwd("/Users/kangyiyuan/Desktop/Consulting Lab/NHANES Data/NHANES 2017_2020")
+library(foreign)
+diet_1720 <- read.xport("P_DBQ.XPT")
+dep_1720 <- read.xport("P_DPQ.XPT")
+fsq_1720 <- read.xport("P_FSQ.XPT")
+sleep_1720 <- read.xport("P_SLQ.XPT")
+demo_1720 <- read.xport("DEMO_17-20XPT")
+bmx_1720 <- read.xport("P_BMX.xpt") 
+alc_1720 <- read.xport("P_ALQ.xpt")
+paq_1720 <- read.xport("P_PAQ.xpt")
+smo_1720 <- read.xport("P_SMQ.xpt")
+```
+
+```{r variable selection 2017_20}
+diet_1720 <- diet_1720 %>% dplyr::select(SEQN, DBQ700)
+dep_1720 <- dep_1720 %>% dplyr::select(SEQN, DPQ010,  DPQ020,  DPQ030,  DPQ040,  DPQ050,  DPQ060,  DPQ070,  DPQ080,  DPQ090,  DPQ100)
+fsq_1720 <- fsq_1720 %>% dplyr::select(SEQN, FSDHH)
+sleep_1720 <- sleep_1720 %>% dplyr::select(SEQN, SLD012)
+demo_1720 <- demo_1720 %>% dplyr::select(SEQN,
+                                         RIAGENDR, # gender
+                                         RIDAGEYR, # age
+                                         RIDRETH1, # race/ethnicity
+                                         DMDBORN4, # country of birth
+                                         DMDMARTZ, # marital status
+                                         DMDEDUC2, # education level
+                                         INDFMPIR, # ratio of family income to poverty 
+                                         WTINTPRP, # full sample interview weight
+                                         WTMECPRP, # full sample 2 year MEC exam weight
+                                         SDMVPSU, # Primary sampling units (PSU)
+                                         SDMVSTRA # strata
+                                         )
+bmx_1720 <- bmx_1720 %>% dplyr::select(SEQN, BMXBMI)
+paq_1720 <- paq_1720 %>% dplyr::select(SEQN, PAD660, PAD675, PAQ655, PAQ670)
+alc_1720 <- alc_1720 %>% dplyr::select(SEQN, ALQ111, ALQ121, ALQ130)
+smo_1720 <- smo_1720 %>% dplyr::select(SEQN, SMQ040, SMQ020)
+```
+
+```{r merge 2017_20}
+library(dplyr)
+merged_1720 <- diet_1720 %>%
+  full_join(dep_1720, by = "SEQN") %>%
+  full_join(fsq_1720, by = "SEQN") %>%
+  full_join(sleep_1720, by = "SEQN") %>%
+  full_join(demo_1720, by = "SEQN") %>%
+  full_join(bmx_1720, by = "SEQN") %>%
+  full_join(alc_1720, by = "SEQN") %>%
+  full_join(paq_1720, by = "SEQN") %>%
+  full_join(smo_1720, by = "SEQN") %>%
+  mutate(Year = "2017-2020")  # Add column for year of cycle
+
+# Recoding missing or unknown entires to NA
+merged_1720[merged_1720 == 7 | merged_1720 == 9 | merged_1720 == 77 | merged_1720 == 99 | merged_1720 == 7777 | merged_1720 == 9999] <- NA
+```
+
+```{r variables recategorize 2013_14 2017_20}
+## SMOKING STATUS
+# Function to categorize smoking status
+categorize_smoking <- function(SMQ020, SMQ040) {
+  if (is.na(SMQ020)) {
+    return("Missing")
+  }
+  if (SMQ020 == 2) {
+    return("Never Smoker")
+  }
+  if (SMQ020 == 1) {
+    if (is.na(SMQ040)) {
+      return("Missing") 
+    }
+    if (SMQ040 == 3) {
+      return("Former Smoker") 
+    }
+    if (SMQ040 == 1 | SMQ040 == 2) {
+      return("Current Smoker") 
+    }
+  }
+  return("Missing") # Catch unhandled cases
+}
+
+# Apply the function to each row
+merged_1720$Smoking_Status <- mapply(categorize_smoking, merged_1720$SMQ020, merged_1720$SMQ040)
+
+## DEPRESSION
+# Calculate the PHQ-9 total score
+merged_1720$PHQ9_Total <- rowSums(merged_1720[, paste0("DPQ", sprintf("%03d", seq(10, 90, 10)))], na.rm = TRUE)
+
+# Create a binary depression status variable
+merged_1720$Depression_Status <- ifelse(merged_1720$PHQ9_Total >= 10, "Depressed", "Not Depressed")
+
+## ALCOHOL USE
+# Step 1: Categorize Non-Drinkers and Drinkers based on ALQ111
+merged_1720$Alcohol_Status <- ifelse(merged_1720$ALQ111 == 2, "Non-Drinker", "Drinker")
+
+# Step 2: Calculate Weekly Frequency of Drinking for Drinkers
+merged_1720$Weekly_Frequency <- with(merged_1720, ifelse(
+  Alcohol_Status == "Non-Drinker", 0, # Non-drinkers have 0 weekly frequency
+  ifelse(ALQ121 == 1, 7,                  # Every day
+  ifelse(ALQ121 == 2, 6,                  # Nearly every day
+  ifelse(ALQ121 == 3, 3.5,                # 3-4 times a week
+  ifelse(ALQ121 == 4, 2,                  # 2 times a week
+  ifelse(ALQ121 == 5, 1,                  # Once a week
+  ifelse(ALQ121 == 6, 0.625,              # 2-3 times a month (≈ 2.5/4 weeks)
+  ifelse(ALQ121 == 7, 0.25,               # Once a month (≈ 1/4 weeks)
+  ifelse(ALQ121 == 8, 0.173,              # 7-11 times a year (≈ 9/52 weeks)
+  ifelse(ALQ121 == 9, 0.115,              # 3-6 times a year (≈ 4.5/52 weeks)
+  ifelse(ALQ121 == 10, 0.038,             # 1-2 times a year (≈ 1.5/52 weeks)
+  NA))))))))))))
+
+# Step 3: Calculate Total Drinks Per Week Using ALQ130
+# ALQ130 represents the number of drinks per drinking day
+merged_1720$Drinks_Per_Week <- with(merged_1720, ifelse( Alcohol_Status == "Non-Drinker", 0, Weekly_Frequency * ALQ130))
+
+# Step 4: Categorize Drinking Level Based on Gender (RIAGENDR) and Weekly Consumption
+merged_1720$Drinking_Category <- with(merged_1720, ifelse(
+  Alcohol_Status == "Non-Drinker", "Non-Drinker",
+  ifelse(RIAGENDR == 1 & Drinks_Per_Week <= 14, "Low-Moderate Drinker", # Men ≤14
+  ifelse(RIAGENDR == 1 & Drinks_Per_Week > 14, "Heavy Drinker",         # Men >14
+  ifelse(RIAGENDR == 2 & Drinks_Per_Week <= 7, "Low-Moderate Drinker",  # Women ≤7
+  ifelse(RIAGENDR == 2 & Drinks_Per_Week > 7, "Heavy Drinker", NA)))))) # Women >7
+
+# Handle Missing Data and Edge Cases
+merged_1720$Drinking_Category[is.na(merged_1720$Alcohol_Status)] <- NA
+merged_1720$Drinking_Category[is.na(merged_1720$Weekly_Frequency)] <- NA
+merged_1720$Drinking_Category[is.na(merged_1720$Drinks_Per_Week)] <- NA
+
+## PHYSICAL ACTIVITY 
+# Calculate Vigorous Minutes/Week and Moderate Minutes/Week
+merged_1720$Vigorous_Minutes_Week <- with(merged_1720, PAQ655 * PAD660)
+
+merged_1720$Moderate_Minutes_Week <- with(merged_1720, PAQ670 * PAD675)
+
+# Calculate Moderate-Equivalent Minutes/Week
+merged_1720$Moderate_Equivalent_Minutes_Week <- merged_1720$Moderate_Minutes_Week + (2 * merged_1720$Vigorous_Minutes_Week)
+
+# Determine if the participant meets the guidelines (≥150 minutes/week)
+merged_1720$Meets_Guidelines <- ifelse(merged_1720$Moderate_Equivalent_Minutes_Week >= 150, "Yes", "No")
+```
+
+## Merging all datasets
+```{r merge}
+# Combine all datasets from all cycles
+final_data <- bind_rows(merged_0910, merged_1112, merged_1314, merged_1516, merged_1720)
+
+# View the final combined dataset
+head(final_data)
+# Assuming final_data_bind_rows is your combined dataset
+write.csv(final_data, "nhanes_combined.csv", row.names = FALSE)
+# Check the data for 2011-2012 entries
+# subset(final_data, Year == "2011-2012")
+
+final_data <- final_data %>%
+  mutate(food_security = case_when(
+    FSDHH == 1 ~ "High food security",
+    FSDHH == 2 ~ "Marginal food security",
+    FSDHH == 3 ~ "Low food security",
+    FSDHH == 4 ~ "Very low food security",
+    TRUE ~ NA_character_
+  ))
+
+
+food_security_counts <- final_data %>%
+  filter(!is.na(food_security)) %>%
+  group_by(food_security) %>%
+  summarise(n = n())
+print(food_security_counts)
+
+# Total n
+total_count <- final_data %>%
+  filter(!is.na(food_security)) %>%
+  summarise(total_n = n())
+print(total_count)
+```
+
+
+# Table 1
+# Age
+```{r}
+library(survey)
+final_data <- final_data %>%
+  mutate(food_security = case_when(
+    FSDHH == 1 ~ "High food security",
+    FSDHH == 2 ~ "Marginal food security",
+    FSDHH == 3 ~ "Low food security",
+    FSDHH == 4 ~ "Very low food security",
+    TRUE ~ NA_character_
+  ))
+
+final_data_age_weight_clean <- final_data %>%
+  filter(!is.na(RIDAGEYR) & !is.na(food_security) & !is.na(WTINTPRP) & !is.na(WTMECPRP)) %>% 
+  mutate(one = 1)
+
+
+survey_design <- svydesign(
+  ids = ~SDMVPSU,
+  strata = ~SDMVSTRA,
+  weights = ~WTINTPRP,
+  data = final_data_age_weight_clean,
+  nest = TRUE)
+
+# Total n
+total_n_age_weight <- svytotal(~one, survey_design)
+print(total_n_age_weight)
+
+
+# Total mean of age
+mean_age_weighted <- svymean(~RIDAGEYR, survey_design)
+sd_age_weighted <- sqrt(attr(mean_age_weighted, "var"))
+print(paste("Weighted Mean Age: ", mean_age_weighted))
+var_age_weighted <- svyvar(~RIDAGEYR, survey_design)
+sd_age_weighted <- sqrt(var_age_weighted)
+print(paste("Weighted Standard Deviation of Age: ", sd_age_weighted))
+
+# Group by food_security 
+age_summary_by_group_weighted <- svyby(
+  ~RIDAGEYR,
+  ~food_security,
+  survey_design,
+  svymean,
+  na.rm = TRUE
+)
+age_summary_by_group_weighted <- age_summary_by_group_weighted %>%
+  mutate(
+    sd_age_weighted = sqrt(RIDAGEYR))
+print(age_summary_by_group_weighted)
+
+# p-value
+anova_result_age_weighted <- svyglm(RIDAGEYR ~ food_security, design = survey_design)
+summary(anova_result_age_weighted)
+
+```
+
+# Age Group
+```{r}
+final_data_clean_bygroup <- final_data_age_weight_clean %>%
+  mutate(age_group = case_when(
+    RIDAGEYR >= 18 & RIDAGEYR <= 39 ~ "18-39 years",
+    RIDAGEYR >= 40 & RIDAGEYR <= 59 ~ "40-59 years",
+    RIDAGEYR >= 60 & RIDAGEYR <= 79 ~ "60-79 years",
+    TRUE ~ NA_character_
+  ))
+age_group_summary <- final_data_clean_bygroup %>%
+  group_by(age_group) %>%
+  summarise(
+    count = n(),
+    percent = (n() / nrow(final_data_clean_bygroup)) * 100)
+print(age_group_summary)
+
+# Group by food_security 
+age_group_food_security_summary <- final_data_clean_bygroup %>%
+  group_by(food_security, age_group) %>%
+  summarise(
+    count = n(),
+    percent = (n() / nrow(final_data_age_weight_clean)) * 100
+  )
+print(age_group_food_security_summary)
+```
+
+# Gender
+```{r}
+final_data_gender_clean <- final_data %>%
+  filter(!is.na(RIAGENDR))
+
+gender_summary <- final_data_gender_clean %>%
+  group_by(RIAGENDR) %>%
+  summarise(
+    count = n(), 
+    percent = (n() / nrow(final_data_gender_clean)) * 100
+  ) %>%
+  mutate(
+    gender = ifelse(RIAGENDR == 1, "Male", "Female")
+  )
+print(gender_summary)
+
+# Group by food_security 
+gender_summary_by_food_security <- final_data_gender_clean %>%
+  group_by(food_security) %>%
+  mutate(total_in_group = n()) %>%
+  group_by(food_security, RIAGENDR) %>%
+  summarise(
+    count = n(),
+    percent = (n() / first(total_in_group)) * 100
+  ) %>%
+  mutate(
+    gender = ifelse(RIAGENDR == 1, "Male", "Female")
+  ) %>%
+  ungroup() %>% 
+  select(food_security, gender, count, percent)
+print(gender_summary_by_food_security)
+```
+
+# Race/Ethnicity
+```{r}
+final_data_race_clean <- final_data %>%
+  filter(!is.na(RIDRETH1)) %>%
+  mutate(
+    race_ethnicity = case_when(
+      RIDRETH1 == 1 ~ "Hispanic",
+      RIDRETH1 == 2 ~ "Non-Hispanic White",
+      RIDRETH1 == 3 ~ "Non-Hispanic Black",
+      RIDRETH1 == 4 ~ "Non-Hispanic Asian",
+      RIDRETH1 == 5 ~ "Other"
+    )
+  )
+
+race_summary <- final_data_race_clean %>%
+  group_by(race_ethnicity) %>%
+  summarise(
+    count = n(),
+    percent = (count / nrow(final_data_race_clean)) * 100
+  )
+print(race_summary)
+
+# Group by Food Security
+race_summary_by_food_security <- final_data_race_clean %>%
+  filter(!is.na(food_security)) %>% 
+  group_by(food_security) %>%
+  mutate(total_in_group = n()) %>% 
+  group_by(food_security, race_ethnicity) %>%
+  summarise(
+    count = n(), 
+    percent = (count / total_in_group[1]) * 100 
+  ) %>%
+  ungroup()
+print(race_summary_by_food_security)
+```
+
+# Education
+```{r}
+final_data_education_clean <- final_data %>%
+  filter(!is.na(DMDEDUC2) & !is.na(food_security))
+
+final_data_education_clean <- final_data_education_clean %>%
+  mutate(education = case_when(
+    DMDEDUC2 == 1 ~ "Less than High School",
+    DMDEDUC2 == 2 ~ "High School",
+    DMDEDUC2 == 3 ~ "Some College",
+    DMDEDUC2 == 4 ~ "College Graduate",
+    TRUE ~ NA_character_
+  ))
+race_summary <- final_data_education_clean %>%
+  group_by(education) %>%
+  summarise(
+    count = n(),
+    percent = (count / nrow(final_data_education_clean)) * 100
+  )
+
+print(race_summary)
+# Group by Food Security
+education_summary_by_food_security <- final_data_education_clean %>%
+  group_by(food_security, education) %>%
+  summarise(
+    count = n()
+  ) %>%
+  mutate(
+    percent = (count / sum(count)) * 100
+  ) %>%
+  ungroup()
+print(education_summary_by_food_security)
+
+```
+
+# Marital Status
+```{r}
+final_data_marital_clean <- final_data %>%
+  filter(!is.na(DMDMARTL)) %>%
+   mutate(
+    marital_status = case_when(
+      DMDMARTL == 1 ~ "Married",
+      DMDMARTL == 2 ~ "Widowed",
+      DMDMARTL == 3 ~ "Divorced",
+      DMDMARTL == 4 ~ "Separated",
+      DMDMARTL == 5 ~ "Never married",
+      DMDMARTL == 6 ~ "Living with partner",
+      TRUE ~ NA_character_
+    )
+  )
+marital_summary <- final_data_marital_clean %>%
+  group_by(marital_status) %>%
+  summarise(
+    count = n(),
+    percent = (count / nrow(final_data_marital_clean)) * 100
+  )
+marital_summary 
+# Group by Food Security
+marital_summary_by_food_security <- final_data_marital_clean %>%
+  group_by(food_security, marital_status) %>%
+  summarise(
+    count = n()) %>%
+  mutate(
+    percent = (count / nrow(final_data_marital_clean)) * 100
+  ) %>%
+  ungroup()
+print(marital_summary_by_food_security)
+```
+
+# Annual family income (dollar)
+```{r}
+final_data_income_clean <- final_data %>%
+  filter(!is.na(INDFMIN2))
+# print(final_data_income_clean)
+
+income_summary <- final_data_income_clean %>%
+  summarise(
+    median_income = median(INDFMIN2, na.rm = TRUE),
+    IQR_income = IQR(INDFMIN2, na.rm = TRUE))
+
+print(income_summary)
+
+# Group by Food Security
+income_summary_by_food_security <- final_data_income_clean %>%
+  group_by(food_security) %>%
+  summarise(
+    median_income = median(INDFMIN2, na.rm = TRUE),
+    IQR_income = IQR(INDFMIN2, na.rm = TRUE))
+print(income_summary_by_food_security)
+```
+
+
+# Income to poverty ratio
+```{r}
+final_data_poverty_clean <- final_data %>%
+  filter(!is.na(INDFMPIR))
+
+poverty_ratio_summary <- final_data_poverty_clean %>%
+  summarise(
+    mean_ratio = mean(INDFMPIR, na.rm = TRUE),
+    sd_ratio = sd(INDFMPIR, na.rm = TRUE)
+  )
+print(poverty_ratio_summary)
+
+# Group by Food Security
+poverty_summary_by_food_security <- final_data_poverty_clean %>%
+  group_by(food_security) %>%
+  summarise(
+    mean_ratio = mean(INDFMPIR, na.rm = TRUE),
+    sd_ratio = sd(INDFMPIR, na.rm = TRUE)
+  )
+print(poverty_summary_by_food_security)
+```
+
+# Nativity
+```{r}
+final_data_nativity_clean <- final_data %>%
+  filter(!is.na(DMDBORN2)) %>%
+  mutate(nativity = case_when(
+    DMDBORN2 == 1 ~ "US born",
+    DMDBORN2 == 2 ~ "Foreign born",
+    TRUE ~ NA_character_
+  ))
+nativity_summary <- final_data_nativity_clean %>%
+  group_by(nativity) %>%
+  summarise(
+    count = n(),
+    percent = (count / nrow(final_data_nativity_clean)) * 100)
+print(nativity_summary)
+
+# Group by food security
+nativity_summary_by_food_security <- final_data_nativity_clean %>%
+  group_by(food_security, nativity) %>%
+  summarise(
+    count = n()
+  ) %>%
+  mutate(
+    percent = (count / sum(count)) * 100
+  ) %>%
+  ungroup()
+print(nativity_summary_by_food_security)
+```
+
+# BMI
+```{r}
+final_data_bmi_clean <- final_data %>%
+  filter(!is.na(BMXBMI)) 
+bmi_summary <- final_data_bmi_clean %>%
+  summarise(
+    mean_bmi = mean(BMXBMI, na.rm = TRUE),
+    sd_bmi = sd(BMXBMI, na.rm = TRUE))
+print(bmi_summary)
+
+final_data_bmi_clean <- final_data_bmi_clean %>%
+  mutate(bmi_category = case_when(
+    BMXBMI < 18.5 ~ "Underweight (<18.5 kg/m²)",
+    BMXBMI >= 18.5 & BMXBMI < 25 ~ "Normal weight (18.5-25 kg/m²)",
+    BMXBMI >= 25 & BMXBMI < 30 ~ "Overweight (25-30 kg/m²)",
+    BMXBMI >= 30 ~ "Obese (≥30 kg/m²)",
+    TRUE ~ NA_character_
+  ))
+# Group by food security
+bmi_summary_by_food_security <- final_data_bmi_clean %>%
+  group_by(food_security) %>%
+  summarise(
+    mean_bmi = mean(BMXBMI, na.rm = TRUE),
+    sd_bmi = sd(BMXBMI, na.rm = TRUE),
+    count = n()
+  )
+bmi_summary_by_food_security
+
+bmi_category_summary <- final_data_bmi_clean %>%
+  group_by(bmi_category) %>%
+  summarise(
+    count = n(),
+    percent = (count / nrow(final_data_bmi_clean)) * 100)
+print(bmi_category_summary)
+
+# Group by food security
+bmi_category_summary_by_food_security <- final_data_bmi_clean %>%
+  group_by(food_security, bmi_category) %>%
+  summarise(
+    count = n()
+  ) %>%
+  mutate(
+    percent = (count / sum(count)) * 100
+  ) %>%
+  ungroup()
+print(bmi_category_summary_by_food_security)
+```
+
+#Smoking Habit
+```{r}
+# Categorize Smoking Status based on SMQ020 and SMQ040
+final_data$Smoking_Status <- with(final_data, 
+                                   ifelse(SMQ020 == 2, "Never Smoker", 
+                                          ifelse(SMQ020 == 1 & SMQ040 == 1, "Current Smoker", 
+                                                 ifelse(SMQ020 == 1 & SMQ040 == 2, "Current Smoker", 
+                                                        ifelse(SMQ020 == 1 & SMQ040 == 3, "Former Smoker", NA)))))
+
+# Calculate the total number of people in each food security group
+total_smoking_habit <- final_data %>%
+  filter(!is.na(Smoking_Status)) %>%
+  group_by(Smoking_Status) %>%
+  summarise(total_count = n())
+total_count_all <- nrow(final_data)
+total_smoking_habit <- total_smoking_habit %>%
+  mutate(percentage = total_count / total_count_all * 100)
+print(total_smoking_habit)
+
+# Create a new dataset grouped by food security and Smoking_Habit
+smoking_food_security <- final_data %>%
+  filter(!is.na(Smoking_Status), !is.na(food_security)) %>%
+  group_by(food_security, Smoking_Status) %>%
+  summarise(count = n())
+
+# Calculate the total number of people in each food security group
+total_food_security <- final_data %>%
+  filter(!is.na(Smoking_Status),!is.na(food_security)) %>%
+  group_by(food_security) %>%
+  summarise(total_count = n())
+
+# Merge the counts with the total count to calculate proportions
+smoking_food_security <- smoking_food_security %>%
+  left_join(total_food_security, by = "food_security") %>%
+  mutate(proportion = count / total_count*100)
+
+# Print out the counts and proportions
+print(smoking_food_security)
+
+```
+
+# Alchol use
+```{r}
+alcohol_use_summary <- final_data %>%
+  group_by(Drinking_Category) %>%
+  count() %>%
+  rename("n" = n)
+
+total_count <- nrow(final_data)
+alcohol_use_summary <- alcohol_use_summary %>%
+  mutate(percentage = (n / total_count) * 100)
+print(alcohol_use_summary)
+
+alcohol_food_security_summary <- final_data %>%
+  group_by(food_security, Drinking_Category) %>%
+  count() %>%
+  rename("n" = n)
+
+# Group by food security
+total_food_security <- final_data %>%
+  group_by(food_security) %>%
+  summarise(total_count = n())
+
+alcohol_food_security_summary <- alcohol_food_security_summary %>%
+  left_join(total_food_security, by = "food_security") %>%
+  mutate(percentage = (n / total_count) * 100)
+
+print(alcohol_food_security_summary)
+```
+
+# Physical Activity
+```{r}
+total_activity_summary <- final_data %>%
+  summarise(
+    total_count = n(),
+    mean_activity = mean(Moderate_Equivalent_Minutes_Week, na.rm = TRUE),
+    sd_activity = sd(Moderate_Equivalent_Minutes_Week, na.rm = TRUE))
+total_activity_summary
+
+# Group by food security and calculate mean and SD for Moderate_Equivalent_Minutes_Week
+physical_activity_summary <- final_data %>%
+  group_by(food_security) %>%
+  summarise(
+    mean_activity = mean(Moderate_Equivalent_Minutes_Week, na.rm = TRUE),
+    sd_activity = sd(Moderate_Equivalent_Minutes_Week, na.rm = TRUE))
+physical_activity_summary
+
+```
+
+
+```{r}
+# No physical activity
+no_physical_activity_count <- sum(final_data$Moderate_Equivalent_Minutes_Week == 0, na.rm = TRUE)
+
+# Not met physical activity recommendation
+not_met_guidelines_count <- sum(final_data$Meets_Guidelines == "No", na.rm = TRUE)
+
+# Met physical activity recommendation
+met_guidelines_count <- sum(final_data$Meets_Guidelines == "Yes", na.rm = TRUE)
+
+# Total count
+total_count <- nrow(final_data)
+
+no_physical_activity_percentage <- (no_physical_activity_count / total_count) * 100
+not_met_guidelines_percentage <- (not_met_guidelines_count / total_count) * 100
+met_guidelines_percentage <- (met_guidelines_count / total_count) * 100
+
+print(paste("No physical activity, n (%):", no_physical_activity_count, "(", round(no_physical_activity_percentage, 2), "%)"))
+print(paste("Not met physical activity recommendation, n (%):", not_met_guidelines_count, "(", round(not_met_guidelines_percentage, 2), "%)"))
+print(paste("Met physical activity recommendation, n (%):", met_guidelines_count, "(", round(met_guidelines_percentage, 2), "%)"))
+
+# By group
+activity_by_food_security <- final_data %>%
+  group_by(food_security) %>%
+  summarise(
+    no_physical_activity_count = sum(Moderate_Equivalent_Minutes_Week == 0, na.rm = TRUE),
+    not_met_guidelines_count = sum(Meets_Guidelines == "No", na.rm = TRUE),
+    met_guidelines_count = sum(Meets_Guidelines == "Yes", na.rm = TRUE),
+    total_count = n(),
+    no_physical_activity_percentage = (no_physical_activity_count / total_count) * 100,
+    not_met_guidelines_percentage = (not_met_guidelines_count / total_count) * 100,
+    met_guidelines_percentage = (met_guidelines_count / total_count) * 100
+  )
+
+print(activity_by_food_security)
+
+```
+
+# PHQ-9 Score
+```{r}
+PHQ_9 <- final_data %>%
+  mutate(PHQ9_score = DPQ010 + DPQ020 + DPQ030 + DPQ040 + DPQ050 + DPQ060 + DPQ070 + DPQ080 + DPQ090 + DPQ100)
+
+phq9_summary <- PHQ_9 %>%
+  summarise(
+    mean_phq9 = mean(PHQ9_score, na.rm = TRUE),
+    sd_phq9 = sd(PHQ9_score, na.rm = TRUE))
+print(phq9_summary)
+
+# By group
+phq9_summary_by_food_security <- PHQ_9 %>%
+  group_by(food_security) %>%
+  summarise(
+    mean_phq9 = mean(PHQ9_score, na.rm = TRUE),
+    sd_phq9 = sd(PHQ9_score, na.rm = TRUE))
+print(phq9_summary_by_food_security)
+```
+
+# Sleep Duration
+```{r}
+final_data_sleep <- final_data %>%
+  mutate(sleep_hours = coalesce(SLD010H, SLD012))
+final_data_sleep_clean <- final_data_sleep %>%
+  filter(!is.na(sleep_hours))
+
+sleep_summary_total <- final_data_sleep_clean %>%
+  summarise(
+    mean_sleep = mean(sleep_hours, na.rm = TRUE),
+    sd_sleep = sd(sleep_hours, na.rm = TRUE))
+print(sleep_summary_total)
+
+# Group by food_security
+sleep_summary_by_food_security <- final_data_sleep_clean %>%
+  group_by(food_security) %>%
+  summarise(
+    mean_sleep = mean(sleep_hours, na.rm = TRUE),
+    sd_sleep = sd(sleep_hours, na.rm = TRUE))
+print(sleep_summary_by_food_security)
+
+```
+
+# Self-rate diet quality
+```{r}
+diet_quality_clean <- final_data %>%
+  filter(DBQ700 != 7 & DBQ700 != 9 & !is.na(DBQ700))
+
+diet_quality_summary <- diet_quality_clean %>%
+  mutate(
+    quality = case_when(
+      DBQ700 == 1 ~ "Excellent",
+      DBQ700 == 2 ~ "Very good",
+      DBQ700 == 3 ~ "Good",
+      DBQ700 %in% c(4, 5) ~ "Fair to poor",
+      TRUE ~ NA_character_
+    )) %>%
+  group_by(quality) %>%
+  summarise(
+    count = n(),  # 每个 quality 的计数
+    .groups = "drop"
+  ) %>%
+  mutate(
+    total_count = sum(count),  # 计算总人数
+    percentage = (count / total_count) * 100  # 计算百分比
+  )
+print(diet_quality_summary)
+
+# By group
+diet_quality_summary_group <- diet_quality_clean %>%
+  mutate(
+    quality = case_when(
+      DBQ700 == 1 ~ "Excellent",
+      DBQ700 == 2 ~ "Very good",
+      DBQ700 == 3 ~ "Good",
+      DBQ700 %in% c(4, 5) ~ "Fair to poor",
+      TRUE ~ NA_character_
+    )) %>%
+  group_by(food_security, quality) %>%
+  summarise(
+    count = n(),  # 每个 quality 的计数
+    .groups = "drop"
+  ) %>%
+  mutate(
+    total_count = sum(count),  # 计算总人数
+    percentage = (count / total_count) * 100  # 计算百分比
+  )
+
+print(diet_quality_summary_group)
+
+```
+
+# Table 2
+```{r}
+library(dplyr)
+library(broom)
+
+# Clean data (remove rows with NA in key variables)
+# Create PHQ9_score first, then filter out NAs
+final_data <- final_data %>%
+  mutate(
+    sleep_hours = coalesce(SLD010H, SLD012),
+    self_rated_diet_quality = case_when(
+      DBQ700 == 1 ~ "Excellent",
+      DBQ700 == 2 ~ "Very good",
+      DBQ700 == 3 ~ "Good",
+      DBQ700 %in% c(4, 5) ~ "Fair to poor",
+      TRUE ~ NA_character_
+    )
+  )
+
+final_data_clean <- final_data %>%
+  mutate(PHQ9_score = DPQ010 + DPQ020 + DPQ030 + DPQ040 + DPQ050 + DPQ060 + DPQ070 + DPQ080 + DPQ090 + DPQ100) %>%
+  filter(!is.na(food_security), !is.na(PHQ9_score), !is.na(sleep_hours), !is.na(self_rated_diet_quality)) %>%
+  mutate(food_security = factor(food_security, levels = c("High food security", "Marginal food security", "Low food security", "Very low food security")))
+
+# Check the cleaned data
+head(final_data_clean)
+
+# Multivariate logistic regression Model 1 (with food security as the outcome variable)
+# Model will include the main variables and adjust for other covariates (age, race, sex, etc.)
+
+model_multivariate <- glm(food_security ~ PHQ9_score + sleep_hours + self_rated_diet_quality + 
+                          RIDAGEYR + RIDRETH1  + RIAGENDR + DMDEDUC2+ BMXBMI + Smoking_Status + Alcohol_Status + Moderate_Equivalent_Minutes_Week,
+                          data = final_data_clean,
+                          family = binomial)
+
+```
+
+
+
+
+
+
+
